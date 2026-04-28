@@ -1,0 +1,7 @@
+# Lyntrix Invest Bot - Protocolo de Desarrollo
+
+1. Arquitectura: Modular Monolith / Agentic Swarm.
+2. Comunicación: Todo intercambio de info entre agentes DEBE ser vía Redis Pub/Sub en formato JSON.
+3. Base de Datos: Usar SQLAlchemy para TimescaleDB. Optimizar queries para series temporales (Hypertables).
+4. IA: Los agentes que requieran LLM deben usar el patrón RAG o llamadas asíncronas para no bloquear el bus de mensajes.
+5. Prohibido: No generes código monolítico sin modularizar. Cada agente debe poder correr en su propio proceso.
