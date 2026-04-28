@@ -1,0 +1,43 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Jupyter / editor noise
+.ipynb_checkpoints/
+.DS_Store
+.idea/
+.vscode/
+
+# Streamlit local state
+.streamlit/secrets.toml
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Local runtime logs/data
+*.log
+tmp/
+data/

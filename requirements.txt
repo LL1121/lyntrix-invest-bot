@@ -1,0 +1,7 @@
+SQLAlchemy
+asyncpg
+redis
+numpy
+yfinance
+streamlit
+pandas
