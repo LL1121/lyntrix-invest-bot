@@ -1,27 +1,156 @@
-version: '3.8'
+# Lyntrix Invest Bot — stack completo (DB, Redis, enjambre, dashboard).
+# En el servidor: copiá .env desde .env.example, completá API keys, y:
+#   docker compose build && docker compose up -d
+#
+# Los workers reciben DB_HOST/REDIS_HOST por compose (no usen 127.0.0.1 en .env
+# para datos dentro de Docker: el `environment` de cada servicio pisa eso).
+
+name: lyntrix-invest-bot
+
+x-lyntrix-worker: &lyntrix-worker
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  env_file:
+    - .env
+  environment: &lyntrix-env
+    DB_HOST: timescaledb
+    DB_PORT: "5432"
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
 
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg15
     container_name: lyntrix_db
+    restart: unless-stopped
     ports:
-      - "5432:5432"
+      # Por defecto solo localhost en el host (evitá exponer Postgres a Internet).
+      - "${DB_BIND:-127.0.0.1}:${DB_PORT:-5435}:5432"
     environment:
-      - POSTGRES_USER=lyntrix_admin
-      - POSTGRES_PASSWORD=lyntrix_pass
-      - POSTGRES_DB=lyntrix_invest
+      - POSTGRES_USER=${DB_USER:-lyntrix_admin}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-lyntrix_pass}
+      - POSTGRES_DB=${DB_NAME:-lyntrix_invest}
     volumes:
       - ./infra/timescale/init.sql:/docker-entrypoint-initdb.d/init.sql
       - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DB_USER:-lyntrix_admin} -d ${DB_NAME:-lyntrix_invest}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   redis:
     image: redis:7-alpine
     container_name: lyntrix_bus
+    restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "${REDIS_BIND:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
-  # Los agentes se sumarán aquí a medida que los desarrollemos
-  # Por ahora, dejamos la base lista para conectarnos desde local o contenedores
+  orchestrator:
+    <<: *lyntrix-worker
+    command: ["python", "-m", "core.orchestrator"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  geo_oracle:
+    <<: *lyntrix-worker
+    command: ["python", "-m", "agents.geo_oracle.agent"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  value_hunter:
+    <<: *lyntrix-worker
+    command: ["python", "-m", "agents.value_hunter.agent"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  macro_scout:
+    <<: *lyntrix-worker
+    command: ["python", "-m", "agents.macro_scout.agent"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  black_swan:
+    <<: *lyntrix-worker
+    command: ["python", "-m", "agents.black_swan.agent"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  whale_scout:
+    <<: *lyntrix-worker
+    command: ["python", "-m", "agents.whale_scout.agent"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  calendar_agent:
+    <<: *lyntrix-worker
+    command: ["python", "-m", "agents.calendar_agent"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  executor:
+    <<: *lyntrix-worker
+    command: ["python", "-m", "core.executor"]
+    depends_on:
+      orchestrator:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    <<: *lyntrix-worker
+    command:
+      [
+        "streamlit",
+        "run",
+        "dashboard/app.py",
+        "--server.address=0.0.0.0",
+        "--server.port=8501",
+      ]
+    ports:
+      - "${DASHBOARD_BIND:-0.0.0.0}:${DASHBOARD_PORT:-8501}:8501"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   timescaledb_data:

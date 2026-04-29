@@ -114,6 +114,14 @@ class MockExecutor:
             await self._panic_sell_all(source_signal=action)
             return
 
+        if action in {"HOLD", "INFO", "NEUTRAL"}:
+            self.logger.info(
+                "No-op execution action received: %s",
+                action,
+            )
+            await self._persist_and_log_balance()
+            return
+
         self.logger.warning("Unsupported execution action: %s", action)
 
     async def _open_or_add_position(

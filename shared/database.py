@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import text
@@ -18,14 +18,15 @@ from sqlalchemy.ext.asyncio import (
 )
 
 LOGGER = logging.getLogger(__name__)
+SCHEMA_INIT_LOCK_KEY = 872341
 
 
 @dataclass(frozen=True)
 class DatabaseConfig:
     """Connection settings for TimescaleDB."""
 
-    host: str = os.getenv("DB_HOST", "localhost")
-    port: int = int(os.getenv("DB_PORT", "5432"))
+    host: str = os.getenv("DB_HOST", "127.0.0.1")
+    port: int = int(os.getenv("DB_PORT", "5435"))
     user: str = os.getenv("DB_USER", "lyntrix_admin")
     password: str = os.getenv("DB_PASSWORD", "lyntrix_pass")
     database: str = os.getenv("DB_NAME", "lyntrix_invest")
@@ -75,6 +76,7 @@ class FinalDecisionRecord:
     votes_for: list[str]
     latest_signals: dict[str, object]
     rationale: str
+    consensus_logic: str
     source: str = "orchestrator"
 
 
@@ -114,6 +116,7 @@ class AgentReportRecord:
     ts: datetime
     agent: str
     payload: dict[str, Any]
+    human_rationale: str | None = None
     channel: str = "agents.reports"
 
 
@@ -206,6 +209,7 @@ class Database:
                     votes_for JSONB NOT NULL,
                     latest_signals JSONB NOT NULL,
                     rationale TEXT NOT NULL,
+                    consensus_logic TEXT,
                     source TEXT NOT NULL DEFAULT 'orchestrator',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (ts)
@@ -252,16 +256,39 @@ class Database:
                     agent TEXT NOT NULL,
                     channel TEXT NOT NULL DEFAULT 'agents.reports',
                     payload JSONB NOT NULL,
+                    human_rationale TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                """
+            ),
+            text(
+                """
+                ALTER TABLE agent_reports
+                ADD COLUMN IF NOT EXISTS human_rationale TEXT;
+                """
+            ),
+            text(
+                """
+                ALTER TABLE final_decisions
+                ADD COLUMN IF NOT EXISTS consensus_logic TEXT;
                 """
             ),
         ]
 
         try:
             async with self._engine.begin() as conn:
-                for statement in statements:
-                    await conn.execute(statement)
+                await conn.execute(
+                    text("SELECT pg_advisory_lock(:lock_key);"),
+                    {"lock_key": SCHEMA_INIT_LOCK_KEY},
+                )
+                try:
+                    for statement in statements:
+                        await conn.execute(statement)
+                finally:
+                    await conn.execute(
+                        text("SELECT pg_advisory_unlock(:lock_key);"),
+                        {"lock_key": SCHEMA_INIT_LOCK_KEY},
+                    )
             LOGGER.info("TimescaleDB hypertables initialized successfully")
         except Exception:
             LOGGER.exception("Failed to initialize TimescaleDB hypertables")
@@ -380,7 +407,10 @@ class Database:
             LOGGER.exception("Failed to upsert macro indicator rows")
             raise
 
-    async def insert_final_decision(self, decision: FinalDecisionRecord) -> None:
+    async def insert_final_decision(
+        self,
+        decision: FinalDecisionRecord,
+    ) -> None:
         """Persist consensus output from orchestrator."""
         statement = text(
             """
@@ -391,6 +421,7 @@ class Database:
                 votes_for,
                 latest_signals,
                 rationale,
+                consensus_logic,
                 source
             )
             VALUES (
@@ -400,6 +431,7 @@ class Database:
                 CAST(:votes_for AS JSONB),
                 CAST(:latest_signals AS JSONB),
                 :rationale,
+                :consensus_logic,
                 :source
             );
             """
@@ -411,6 +443,7 @@ class Database:
             "votes_for": json.dumps(decision.votes_for),
             "latest_signals": json.dumps(decision.latest_signals),
             "rationale": decision.rationale,
+            "consensus_logic": decision.consensus_logic,
             "source": decision.source,
         }
 
@@ -453,7 +486,10 @@ class Database:
                 return None
             return float(row[0])
         except Exception:
-            LOGGER.exception("Failed fetching latest candle close for %s", symbol)
+            LOGGER.exception(
+                "Failed fetching latest candle close for %s",
+                symbol,
+            )
             raise
 
     async def insert_executed_trade(self, trade: ExecutedTradeRecord) -> None:
@@ -573,13 +609,15 @@ class Database:
                 ts,
                 agent,
                 channel,
-                payload
+                payload,
+                human_rationale
             )
             VALUES (
                 :ts,
                 :agent,
                 :channel,
-                CAST(:payload AS JSONB)
+                CAST(:payload AS JSONB),
+                :human_rationale
             );
             """
         )
@@ -588,6 +626,7 @@ class Database:
             "agent": report.agent,
             "channel": report.channel,
             "payload": json.dumps(report.payload),
+            "human_rationale": report.human_rationale,
         }
         try:
             async with self._engine.begin() as conn:
@@ -621,19 +660,33 @@ class Database:
             """
             SELECT ts, total_equity, cash_balance, positions_value
             FROM portfolio_history
-            WHERE (:start_ts IS NULL OR ts >= :start_ts)
-              AND (:end_ts IS NULL OR ts < :end_ts)
+            WHERE (
+                CAST(:start_ts AS TIMESTAMPTZ) IS NULL
+                OR ts >= CAST(:start_ts AS TIMESTAMPTZ)
+            )
+              AND (
+                CAST(:end_ts AS TIMESTAMPTZ) IS NULL
+                OR ts < CAST(:end_ts AS TIMESTAMPTZ)
+              )
             ORDER BY ts ASC;
             """
         )
         params = {
             "start_ts": (
-                datetime.combine(start_date, datetime.min.time(), tzinfo=None)
+                datetime.combine(
+                    start_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
                 if start_date
                 else None
             ),
             "end_ts": (
-                datetime.combine(end_date, datetime.min.time(), tzinfo=None)
+                datetime.combine(
+                    end_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
                 if end_date
                 else None
             ),
@@ -647,11 +700,15 @@ class Database:
         statement = text(
             """
             WITH ranked AS (
-                SELECT ts, agent, payload,
+                SELECT
+                       ts,
+                       agent,
+                       payload,
+                       human_rationale,
                        ROW_NUMBER() OVER (PARTITION BY agent ORDER BY ts DESC) AS rn
                 FROM agent_reports
             )
-            SELECT ts, agent, payload
+            SELECT ts, agent, payload, human_rationale
             FROM ranked
             WHERE rn = 1
             ORDER BY ts DESC;
@@ -706,22 +763,42 @@ class Database:
         """Return consensus decisions timeline."""
         statement = text(
             """
-            SELECT ts, action, consensus_score, votes_for, rationale
+            SELECT
+                ts,
+                action,
+                consensus_score,
+                votes_for,
+                rationale,
+                consensus_logic
             FROM final_decisions
-            WHERE (:start_ts IS NULL OR ts >= :start_ts)
-              AND (:end_ts IS NULL OR ts < :end_ts)
+            WHERE (
+                CAST(:start_ts AS TIMESTAMPTZ) IS NULL
+                OR ts >= CAST(:start_ts AS TIMESTAMPTZ)
+            )
+              AND (
+                CAST(:end_ts AS TIMESTAMPTZ) IS NULL
+                OR ts < CAST(:end_ts AS TIMESTAMPTZ)
+              )
             ORDER BY ts DESC
             LIMIT :limit_n;
             """
         )
         params = {
             "start_ts": (
-                datetime.combine(start_date, datetime.min.time(), tzinfo=None)
+                datetime.combine(
+                    start_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
                 if start_date
                 else None
             ),
             "end_ts": (
-                datetime.combine(end_date, datetime.min.time(), tzinfo=None)
+                datetime.combine(
+                    end_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
                 if end_date
                 else None
             ),
@@ -738,8 +815,14 @@ class Database:
             WITH trade_rollup AS (
                 SELECT
                     symbol,
-                    SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS net_qty,
-                    SUM(CASE WHEN side = 'BUY' THEN notional + fee ELSE 0 END) AS buy_cost
+                    SUM(
+                        CASE WHEN side = 'BUY'
+                        THEN quantity ELSE -quantity END
+                    ) AS net_qty,
+                    SUM(
+                        CASE WHEN side = 'BUY'
+                        THEN notional + fee ELSE 0 END
+                    ) AS buy_cost
                 FROM executed_trades
                 GROUP BY symbol
             ),
@@ -800,21 +883,38 @@ class Database:
                 realized_pnl,
                 source_signal
             FROM executed_trades
-            WHERE (:start_ts IS NULL OR ts >= :start_ts)
-              AND (:end_ts IS NULL OR ts < :end_ts)
-              AND (:symbol_filter IS NULL OR symbol = :symbol_filter)
+            WHERE (
+                CAST(:start_ts AS TIMESTAMPTZ) IS NULL
+                OR ts >= CAST(:start_ts AS TIMESTAMPTZ)
+            )
+              AND (
+                CAST(:end_ts AS TIMESTAMPTZ) IS NULL
+                OR ts < CAST(:end_ts AS TIMESTAMPTZ)
+              )
+              AND (
+                CAST(:symbol_filter AS TEXT) IS NULL
+                OR symbol = CAST(:symbol_filter AS TEXT)
+              )
             ORDER BY ts DESC
             LIMIT :limit_n;
             """
         )
         params = {
             "start_ts": (
-                datetime.combine(start_date, datetime.min.time(), tzinfo=None)
+                datetime.combine(
+                    start_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
                 if start_date
                 else None
             ),
             "end_ts": (
-                datetime.combine(end_date, datetime.min.time(), tzinfo=None)
+                datetime.combine(
+                    end_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
                 if end_date
                 else None
             ),
@@ -823,4 +923,517 @@ class Database:
         }
         async with self._engine.begin() as conn:
             rows = (await conn.execute(statement, params)).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def fetch_candles_history(
+        self,
+        symbols: list[str],
+        start_date: date | None,
+        end_date: date | None,
+        timeframe: str = "1d",
+    ) -> list[dict[str, Any]]:
+        """Return candle close history for selected symbols/date range."""
+        if not symbols:
+            return []
+        statement = text(
+            """
+            SELECT ts, symbol, close, volume
+            FROM candles
+            WHERE symbol = ANY(CAST(:symbols AS TEXT[]))
+              AND timeframe = :timeframe
+              AND (
+                CAST(:start_ts AS TIMESTAMPTZ) IS NULL
+                OR ts >= CAST(:start_ts AS TIMESTAMPTZ)
+              )
+              AND (
+                CAST(:end_ts AS TIMESTAMPTZ) IS NULL
+                OR ts < CAST(:end_ts AS TIMESTAMPTZ)
+              )
+            ORDER BY ts ASC;
+            """
+        )
+        params = {
+            "symbols": symbols,
+            "timeframe": timeframe,
+            "start_ts": (
+                datetime.combine(
+                    start_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
+                if start_date
+                else None
+            ),
+            "end_ts": (
+                datetime.combine(
+                    end_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
+                if end_date
+                else None
+            ),
+        }
+        async with self._engine.begin() as conn:
+            rows = (await conn.execute(statement, params)).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def fetch_reports_for_query(
+        self,
+        keywords: list[str],
+        asset_symbols: list[str],
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return recent reports filtered by asset or keyword matches."""
+        pattern_values = [f"%{term}%" for term in keywords if term]
+        statement = text(
+            """
+            SELECT ts, agent, payload, human_rationale
+            FROM agent_reports
+            WHERE (
+                CARDINALITY(CAST(:asset_symbols AS TEXT[])) = 0
+                OR (payload ->> 'asset') = ANY(CAST(:asset_symbols AS TEXT[]))
+            )
+               OR (
+                CARDINALITY(CAST(:patterns AS TEXT[])) > 0
+                AND (
+                    COALESCE(human_rationale, '') ILIKE ANY(CAST(:patterns AS TEXT[]))
+                    OR CAST(payload AS TEXT) ILIKE ANY(CAST(:patterns AS TEXT[]))
+                )
+            )
+            ORDER BY ts DESC
+            LIMIT :limit_n;
+            """
+        )
+        params = {
+            "asset_symbols": asset_symbols,
+            "patterns": pattern_values,
+            "limit_n": limit,
+        }
+        async with self._engine.begin() as conn:
+            rows = (await conn.execute(statement, params)).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def fetch_recent_final_decisions(
+        self,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return most recent consensus decisions for conversational context."""
+        statement = text(
+            """
+            SELECT
+                ts,
+                action,
+                consensus_score,
+                rationale,
+                consensus_logic
+            FROM final_decisions
+            ORDER BY ts DESC
+            LIMIT :limit_n;
+            """
+        )
+        async with self._engine.begin() as conn:
+            rows = (
+                await conn.execute(statement, {"limit_n": limit})
+            ).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def fetch_whale_open_interest_series(
+        self,
+        symbols: list[str],
+        start_date: date | None,
+        end_date: date | None,
+    ) -> list[dict[str, Any]]:
+        """Return WhaleScout OI proxy series from macro_indicators."""
+        if not symbols:
+            return []
+        indicators = [f"WHALE_OI::{sym}" for sym in symbols]
+        statement = text(
+            """
+            SELECT ts, indicator, value
+            FROM macro_indicators
+            WHERE indicator = ANY(CAST(:indicators AS TEXT[]))
+              AND country = 'global'
+              AND (
+                CAST(:start_ts AS TIMESTAMPTZ) IS NULL
+                OR ts >= CAST(:start_ts AS TIMESTAMPTZ)
+              )
+              AND (
+                CAST(:end_ts AS TIMESTAMPTZ) IS NULL
+                OR ts < CAST(:end_ts AS TIMESTAMPTZ)
+              )
+            ORDER BY ts ASC;
+            """
+        )
+        params = {
+            "indicators": indicators,
+            "start_ts": (
+                datetime.combine(
+                    start_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
+                if start_date
+                else None
+            ),
+            "end_ts": (
+                datetime.combine(
+                    end_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
+                if end_date
+                else None
+            ),
+        }
+        async with self._engine.begin() as conn:
+            rows = (await conn.execute(statement, params)).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def fetch_calendar_agent_events(
+        self,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Latest calendar_agent rows for macro countdown UI."""
+        statement = text(
+            """
+            SELECT ts, payload
+            FROM agent_reports
+            WHERE agent = 'calendar_agent'
+            ORDER BY ts DESC
+            LIMIT :limit_n;
+            """
+        )
+        async with self._engine.begin() as conn:
+            rows = (
+                await conn.execute(statement, {"limit_n": limit})
+            ).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def fetch_closes_for_zscore(
+        self,
+        symbols: list[str],
+        bars: int = 22,
+        timeframe: str = "1d",
+    ) -> list[dict[str, Any]]:
+        """Last N daily closes per symbol (window over hypertable)."""
+        if not symbols:
+            return []
+        statement = text(
+            """
+            WITH ranked AS (
+                SELECT
+                    ts,
+                    symbol,
+                    close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol ORDER BY ts DESC
+                    ) AS rn
+                FROM candles
+                WHERE timeframe = :timeframe
+                  AND symbol = ANY(CAST(:symbols AS TEXT[]))
+            )
+            SELECT ts, symbol, close
+            FROM ranked
+            WHERE rn <= :bars
+            ORDER BY symbol, ts ASC;
+            """
+        )
+        async with self._engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    statement,
+                    {"symbols": symbols, "bars": bars, "timeframe": timeframe},
+                )
+            ).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def fetch_dashboard_bundle(
+        self,
+        start_date: date,
+        end_date: date,
+        trades_symbol: str | None,
+        trades_limit: int,
+    ) -> dict[str, Any]:
+        """Load dashboard datasets in one DB session (fewer pool round-trips)."""
+        start_ts = datetime.combine(
+            start_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+        end_ts = datetime.combine(
+            end_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+        sym_candles = ["HG=F", "GC=F", "NLR"]
+        whale_inds = ["WHALE_OI::HG=F", "WHALE_OI::GC=F"]
+
+        snap_sql = text(
+            """
+            SELECT ts, cash_balance, positions_value, total_equity,
+                   realized_pnl, unrealized_pnl
+            FROM portfolio_history
+            ORDER BY ts DESC
+            LIMIT 1;
+            """
+        )
+        hist_sql = text(
+            """
+            SELECT ts, total_equity, cash_balance, positions_value
+            FROM portfolio_history
+            WHERE ts >= :start_ts AND ts < :end_ts
+            ORDER BY ts ASC;
+            """
+        )
+        reports_sql = text(
+            """
+            WITH ranked AS (
+                SELECT
+                       ts,
+                       agent,
+                       payload,
+                       human_rationale,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY agent ORDER BY ts DESC
+                       ) AS rn
+                FROM agent_reports
+            )
+            SELECT ts, agent, payload, human_rationale
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY ts DESC;
+            """
+        )
+        decisions_sql = text(
+            """
+            SELECT ts, action, consensus_score, votes_for, rationale,
+                   consensus_logic
+            FROM final_decisions
+            WHERE ts >= :start_ts AND ts < :end_ts
+            ORDER BY ts DESC
+            LIMIT 50;
+            """
+        )
+        positions_sql = text(
+            """
+            WITH trade_rollup AS (
+                SELECT
+                    symbol,
+                    SUM(
+                        CASE WHEN side = 'BUY'
+                        THEN quantity ELSE -quantity END
+                    ) AS net_qty,
+                    SUM(
+                        CASE WHEN side = 'BUY'
+                        THEN notional + fee ELSE 0 END
+                    ) AS buy_cost
+                FROM executed_trades
+                GROUP BY symbol
+            ),
+            latest_prices AS (
+                SELECT DISTINCT ON (symbol)
+                    symbol,
+                    close AS mark_price
+                FROM candles
+                WHERE timeframe = '1d'
+                ORDER BY symbol, ts DESC
+            )
+            SELECT
+                t.symbol,
+                t.net_qty,
+                CASE
+                    WHEN t.net_qty > 0 THEN t.buy_cost / NULLIF(
+                        (
+                            SELECT SUM(quantity)
+                            FROM executed_trades et
+                            WHERE et.symbol = t.symbol
+                              AND et.side = 'BUY'
+                        ),
+                        0
+                    )
+                    ELSE 0
+                END AS avg_entry_price,
+                COALESCE(lp.mark_price, 0) AS mark_price,
+                t.net_qty * COALESCE(lp.mark_price, 0) AS market_value
+            FROM trade_rollup t
+            LEFT JOIN latest_prices lp ON lp.symbol = t.symbol
+            WHERE t.net_qty > 1e-10
+            ORDER BY market_value DESC;
+            """
+        )
+        trades_sql = text(
+            """
+            SELECT ts, side, symbol, quantity, price, fee, slippage,
+                   notional, realized_pnl, source_signal
+            FROM executed_trades
+            WHERE ts >= :start_ts AND ts < :end_ts
+              AND (
+                CAST(:symbol_filter AS TEXT) IS NULL
+                OR symbol = CAST(:symbol_filter AS TEXT)
+              )
+            ORDER BY ts DESC
+            LIMIT :limit_n;
+            """
+        )
+        macro_sql = text(
+            """
+            SELECT payload ->> 'macro_regime' AS macro_regime
+            FROM agent_reports
+            WHERE agent = 'macro_scout'
+              AND payload ? 'macro_regime'
+            ORDER BY ts DESC
+            LIMIT 1;
+            """
+        )
+        bs_sql = text(
+            """
+            SELECT payload ->> 'risk_level' AS risk_level
+            FROM agent_reports
+            WHERE agent = 'black_swan'
+              AND payload ? 'risk_level'
+            ORDER BY ts DESC
+            LIMIT 1;
+            """
+        )
+        candles_sql = text(
+            """
+            SELECT ts, symbol, close, volume
+            FROM candles
+            WHERE symbol = ANY(CAST(:symbols AS TEXT[]))
+              AND timeframe = '1d'
+              AND ts >= :start_ts AND ts < :end_ts
+            ORDER BY ts ASC;
+            """
+        )
+        whale_sql = text(
+            """
+            SELECT ts, indicator, value
+            FROM macro_indicators
+            WHERE indicator = ANY(CAST(:indicators AS TEXT[]))
+              AND country = 'global'
+              AND ts >= :start_ts AND ts < :end_ts
+            ORDER BY ts ASC;
+            """
+        )
+        cal_sql = text(
+            """
+            SELECT ts, payload
+            FROM agent_reports
+            WHERE agent = 'calendar_agent'
+            ORDER BY ts DESC
+            LIMIT 5;
+            """
+        )
+        z_sql = text(
+            """
+            WITH ranked AS (
+                SELECT ts, symbol, close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol ORDER BY ts DESC
+                    ) AS rn
+                FROM candles
+                WHERE timeframe = '1d'
+                  AND symbol = ANY(CAST(:symbols AS TEXT[]))
+            )
+            SELECT ts, symbol, close
+            FROM ranked
+            WHERE rn <= 22
+            ORDER BY symbol, ts ASC;
+            """
+        )
+
+        async with self._engine.connect() as conn:
+            snap = (await conn.execute(snap_sql)).mappings().first()
+            hist = (
+                await conn.execute(hist_sql, {"start_ts": start_ts, "end_ts": end_ts})
+            ).mappings().all()
+            reps = (await conn.execute(reports_sql)).mappings().all()
+            decs = (
+                await conn.execute(
+                    decisions_sql,
+                    {"start_ts": start_ts, "end_ts": end_ts},
+                )
+            ).mappings().all()
+            pos = (await conn.execute(positions_sql)).mappings().all()
+            trd = (
+                await conn.execute(
+                    trades_sql,
+                    {
+                        "start_ts": start_ts,
+                        "end_ts": end_ts,
+                        "symbol_filter": trades_symbol,
+                        "limit_n": trades_limit,
+                    },
+                )
+            ).mappings().all()
+            macro_row = (await conn.execute(macro_sql)).first()
+            bs_row = (await conn.execute(bs_sql)).first()
+            cndl = (
+                await conn.execute(
+                    candles_sql,
+                    {
+                        "symbols": sym_candles,
+                        "start_ts": start_ts,
+                        "end_ts": end_ts,
+                    },
+                )
+            ).mappings().all()
+            whale = (
+                await conn.execute(
+                    whale_sql,
+                    {
+                        "indicators": whale_inds,
+                        "start_ts": start_ts,
+                        "end_ts": end_ts,
+                    },
+                )
+            ).mappings().all()
+            cal = (await conn.execute(cal_sql)).mappings().all()
+            zrows = (
+                await conn.execute(z_sql, {"symbols": sym_candles})
+            ).mappings().all()
+
+        return {
+            "snapshot": dict(snap) if snap else None,
+            "history": [dict(r) for r in hist],
+            "reports": [dict(r) for r in reps],
+            "decisions": [dict(r) for r in decs],
+            "positions": [dict(r) for r in pos],
+            "trades": [dict(r) for r in trd],
+            "macro_regime": (
+                str(macro_row[0]) if macro_row and macro_row[0] else None
+            ),
+            "black_swan_risk": (
+                str(bs_row[0]) if bs_row and bs_row[0] else None
+            ),
+            "candles": [dict(r) for r in cndl],
+            "whale_oi": [dict(r) for r in whale],
+            "calendar_events": [dict(r) for r in cal],
+            "zscore_closes": [dict(r) for r in zrows],
+        }
+
+    async def fetch_recent_portfolio_snapshots(
+        self,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return latest portfolio snapshots for conversational context."""
+        statement = text(
+            """
+            SELECT
+                ts,
+                cash_balance,
+                positions_value,
+                total_equity,
+                realized_pnl,
+                unrealized_pnl
+            FROM portfolio_history
+            ORDER BY ts DESC
+            LIMIT :limit_n;
+            """
+        )
+        async with self._engine.begin() as conn:
+            rows = (
+                await conn.execute(statement, {"limit_n": limit})
+            ).mappings().all()
         return [dict(row) for row in rows]

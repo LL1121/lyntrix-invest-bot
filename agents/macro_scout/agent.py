@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
 from agents.base_agent import BaseAgent
@@ -29,11 +30,13 @@ class MacroSeriesSnapshot:
 
     @property
     def current(self) -> float:
-        return float(self.closes[-1])
+        latest = np.asarray(self.closes).reshape(-1)[-1]
+        return float(latest)
 
     @property
     def prev(self) -> float:
-        return float(self.closes[-2])
+        previous = np.asarray(self.closes).reshape(-1)[-2]
+        return float(previous)
 
     @property
     def sma_5(self) -> float:
@@ -212,8 +215,16 @@ class MacroScoutAgent(BaseAgent):
                 )
                 continue
 
+            frame = self._normalize_ohlcv_frame(frame)
+            if frame.empty:
+                self.logger.warning(
+                    "Invalid OHLC structure for %s after normalization",
+                    symbol,
+                )
+                continue
+
             closes = frame["Close"].dropna().tail(self.LOOKBACK_WINDOW_DAYS)
-            close_values = closes.to_numpy(dtype=float)
+            close_values = np.asarray(closes.to_numpy(dtype=float)).reshape(-1)
             if close_values.size < 20:
                 self.logger.warning(
                     "Not enough bars for %s (got=%s need=20)",
@@ -230,6 +241,37 @@ class MacroScoutAgent(BaseAgent):
         if not set(self.REQUIRED_SYMBOLS).issubset(snapshots.keys()):
             return None
         return snapshots
+
+    def _normalize_ohlcv_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Normalize provider output to flat OHLCV columns."""
+        if frame.empty:
+            return frame
+
+        normalized = frame.copy()
+        if isinstance(normalized.columns, pd.MultiIndex):
+            if normalized.columns.nlevels >= 2:
+                last_level = normalized.columns.get_level_values(-1)
+                if {"Open", "High", "Low", "Close"}.issubset(set(last_level)):
+                    normalized.columns = last_level
+                else:
+                    normalized.columns = normalized.columns.get_level_values(0)
+            else:
+                normalized.columns = normalized.columns.get_level_values(0)
+
+        normalized.columns = [str(column) for column in normalized.columns]
+        required = ["Open", "High", "Low", "Close"]
+        if not all(column in normalized.columns for column in required):
+            return pd.DataFrame()
+        if "Volume" not in normalized.columns:
+            normalized["Volume"] = np.nan
+        normalized = normalized[["Open", "High", "Low", "Close", "Volume"]]
+        for column in ["Open", "High", "Low", "Close", "Volume"]:
+            normalized[column] = pd.to_numeric(
+                normalized[column],
+                errors="coerce",
+            )
+        normalized = normalized.dropna(subset=["Open", "High", "Low", "Close"])
+        return normalized
 
     async def _persist_macro_indicators(
         self,
@@ -371,3 +413,23 @@ class MacroScoutAgent(BaseAgent):
         self.logger.warning(
             "Published macro divergence WARNING against copper BUY",
         )
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
+
+
+async def main() -> None:
+    configure_logging()
+    agent = MacroScoutAgent()
+    await agent.run()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        LOGGER.info("MacroScout interrupted by user")

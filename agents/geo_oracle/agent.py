@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
+from urllib.parse import urlencode
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from agents.base_agent import BaseAgent
+import groq
+from groq import AsyncGroq
 
 LOGGER = logging.getLogger(__name__)
 Sector = Literal["Energy", "Tech", "Commodities"]
@@ -42,11 +49,14 @@ class GeoOracleAgent(BaseAgent):
 
     def __init__(self) -> None:
         super().__init__(name="geo_oracle")
-        self._llm_provider = os.getenv("LLM_PROVIDER", "mock").lower()
+        self._llm_provider = os.getenv("LLM_PROVIDER", "groq").lower()
+        self._groq_api_key = os.getenv("GROQ_API_KEY")
+        self._groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         self._openai_api_key = os.getenv("OPENAI_API_KEY")
         self._anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         self._news_api_key = os.getenv("NEWS_API_KEY")
         self._analysis_task: asyncio.Task[None] | None = None
+        self.client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 
     @property
     def topics(self) -> list[str]:
@@ -59,7 +69,11 @@ class GeoOracleAgent(BaseAgent):
     ) -> None:
         """React to inbound control messages."""
         if channel != "system.heartbeat":
-            self.logger.debug("Ignored channel %s payload=%s", channel, payload)
+            self.logger.debug(
+                "Ignored channel %s payload=%s",
+                channel,
+                payload,
+            )
             return
 
         self.logger.info("Heartbeat received, triggering immediate analysis")
@@ -67,7 +81,9 @@ class GeoOracleAgent(BaseAgent):
 
     async def run(self) -> None:
         """Run both periodic analysis loop and heartbeat listener."""
-        self._analysis_task = asyncio.create_task(self._periodic_analysis_loop())
+        self._analysis_task = asyncio.create_task(
+            self._periodic_analysis_loop(),
+        )
         try:
             await super().run()
         finally:
@@ -121,19 +137,27 @@ class GeoOracleAgent(BaseAgent):
             self.logger.exception("GeoOracle analysis cycle failed")
 
     async def _fetch_financial_news(self) -> list[NewsArticle]:
-        """Mock async ingestion of financial and geopolitical headlines."""
+        """Fetch latest geopolitical-financial news from NewsAPI."""
         if self._news_api_key:
-            self.logger.info(
-                "NEWS_API_KEY detected, using mocked provider integration path",
-            )
+            try:
+                return await self._fetch_newsapi_articles()
+            except Exception:
+                self.logger.exception(
+                    "NewsAPI request failed, using local fallback",
+                )
         else:
-            self.logger.warning("NEWS_API_KEY is not set, using local mock headlines")
+            self.logger.warning(
+                "NEWS_API_KEY is not set, using local mock headlines",
+            )
 
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.02)
         now = datetime.now(UTC)
         return [
             NewsArticle(
-                title="Freight bottlenecks pressure uranium routes in key chokepoints",
+                title=(
+                    "Freight bottlenecks pressure uranium routes "
+                    "in key chokepoints"
+                ),
                 summary=(
                     "Shipping insurers reprice risk amid regional tensions, "
                     "raising short-term nuclear fuel transport costs."
@@ -142,7 +166,10 @@ class GeoOracleAgent(BaseAgent):
                 published_at=now,
             ),
             NewsArticle(
-                title="Copper smelter maintenance narrows refined output guidance",
+                title=(
+                    "Copper smelter maintenance narrows "
+                    "refined output guidance"
+                ),
                 summary=(
                     "Unexpected downtime in multiple facilities tightens global "
                     "inventories while demand from grid projects remains firm."
@@ -151,31 +178,99 @@ class GeoOracleAgent(BaseAgent):
                 published_at=now,
             ),
             NewsArticle(
-                title="Policy split on AI capex rotates flows toward hard assets",
+                title=(
+                    "Policy split on AI capex rotates "
+                    "flows toward hard assets"
+                ),
                 summary=(
-                    "Institutional desks report lower overweight in mega-cap tech "
-                    "and increased allocation to commodities-linked producers."
+                    "Institutional desks report lower overweight in "
+                    "mega-cap tech and increased allocation to "
+                    "commodities-linked producers."
                 ),
                 source="mock-macro",
                 published_at=now,
             ),
         ]
 
+    async def _fetch_newsapi_articles(self) -> list[NewsArticle]:
+        """Pull macro/geopolitical commodity headlines from NewsAPI."""
+        query = (
+            "copper OR uranium OR oil OR nuclear OR hydroelectric OR "
+            "geopolitics OR supply chain"
+        )
+        params = urlencode(
+            {
+                "q": query,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": "20",
+                "apiKey": self._news_api_key,
+            }
+        )
+        url = f"https://newsapi.org/v2/everything?{params}"
+        response_data = await asyncio.to_thread(self._http_get_json, url)
+        raw_articles = response_data.get("articles", [])
+        if not isinstance(raw_articles, list) or not raw_articles:
+            raise RuntimeError("NewsAPI returned no articles")
+
+        articles: list[NewsArticle] = []
+        for item in raw_articles:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            summary = str(item.get("description", "")).strip()
+            if not title:
+                continue
+            source_obj = item.get("source", {})
+            source = (
+                str(source_obj.get("name", "newsapi"))
+                if isinstance(source_obj, dict)
+                else "newsapi"
+            )
+            published_raw = str(item.get("publishedAt", ""))
+            published_at = datetime.now(UTC)
+            if published_raw:
+                try:
+                    published_at = datetime.fromisoformat(
+                        published_raw.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    pass
+            articles.append(
+                NewsArticle(
+                    title=title,
+                    summary=summary or "No description provided.",
+                    source=source,
+                    published_at=published_at,
+                )
+            )
+            if len(articles) >= 8:
+                break
+
+        if not articles:
+            raise RuntimeError("NewsAPI returned no parsable articles")
+        return articles
+
     async def _analyze_with_llm(
         self,
         articles: list[NewsArticle],
     ) -> GeopoliticalAnalysis:
-        """Asynchronous LLM placeholder for geopolitical impact scoring."""
+        """Asynchronous LLM analysis with Groq as primary provider."""
         prompt = self._build_prompt(articles)
         self.logger.debug("GeoOracle prompt prepared: %s", prompt)
 
+        if self._llm_provider == "groq" and self._groq_api_key:
+            return await self._call_groq_llm(prompt, articles)
         if self._llm_provider == "openai" and self._openai_api_key:
             return await self._call_openai_placeholder(prompt, articles)
         if self._llm_provider == "anthropic" and self._anthropic_api_key:
             return await self._call_anthropic_placeholder(prompt, articles)
 
         self.logger.warning(
-            "No valid LLM provider credentials configured, using heuristic fallback",
+            (
+                "No valid LLM provider credentials configured, "
+                "using heuristic fallback"
+            ),
         )
         return await self._heuristic_analysis(articles)
 
@@ -188,11 +283,73 @@ class GeoOracleAgent(BaseAgent):
             "Date: 2026-04-28.\n"
             "You are a geopolitical market analyst. Assess supply-chain risks and "
             "global tensions affecting Energy, Tech, and Commodities. "
-            "Avoid AI bubble overexposure bias, account for oil upside.\n"
-            "Return JSON with keys: sentiment_score (-1.0 to 1.0), "
+            "Use current context: Brent crude near $111 and capital rotation "
+            "toward commodities producers and hard assets.\n"
+            "Return STRICT JSON with keys: "
+            "sentiment_score (-1.0 to 1.0), "
             "impacted_sectors (subset of [Energy, Tech, Commodities]), summary.\n"
             f"News:\n{headlines}"
         )
+
+    async def _call_groq_llm(
+        self,
+        prompt: str,
+        articles: list[NewsArticle],
+    ) -> GeopoliticalAnalysis:
+        """Run Groq via official async SDK with retry on rate limits."""
+        assert self._groq_api_key is not None
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            try:
+                completion = await self.client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    temperature=0.2,
+                    max_tokens=1024,
+                    stream=False,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are GeoOracle for an investment swarm. "
+                                "Date context: 2026-04-28. Brent crude is near "
+                                "$111 and capital rotates toward commodities. "
+                                "Output ONLY strict JSON with keys "
+                                "sentiment_score, impacted_sectors, summary."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                content = completion.choices[0].message.content
+                if content is None:
+                    raise RuntimeError("Groq returned empty content")
+                parsed = self._parse_llm_json(content)
+                sentiment = float(parsed["sentiment_score"])
+                sectors = parsed["impacted_sectors"]
+                if not isinstance(sectors, list):
+                    raise TypeError("impacted_sectors must be list")
+                clean_sectors = [str(sector) for sector in sectors][:3]
+                summary = str(parsed["summary"])
+                return GeopoliticalAnalysis(
+                    sentiment_score=max(-1.0, min(1.0, sentiment)),
+                    impacted_sectors=clean_sectors or ["Commodities"],
+                    summary=summary,
+                )
+            except groq.RateLimitError:
+                if attempt >= max_attempts:
+                    raise
+                sleep_s = 2 ** attempt
+                self.logger.warning(
+                    "Groq rate limit hit (attempt %s/%s), retrying in %ss",
+                    attempt,
+                    max_attempts,
+                    sleep_s,
+                )
+                await asyncio.sleep(sleep_s)
+            except Exception:
+                self.logger.exception("Groq request failed without fallback")
+                raise
 
     async def _call_openai_placeholder(
         self,
@@ -221,7 +378,8 @@ class GeoOracleAgent(BaseAgent):
         """Fallback deterministic analyzer preserving async behavior."""
         await asyncio.sleep(0.01)
         merged_text = " ".join(
-            f"{article.title} {article.summary}".lower() for article in articles
+            f"{article.title} {article.summary}".lower()
+            for article in articles
         )
         score = 0.0
         sectors: set[Sector] = set()
@@ -251,3 +409,60 @@ class GeoOracleAgent(BaseAgent):
             impacted_sectors=impacted_sectors,
             summary=summary,
         )
+
+    def _http_get_json(self, url: str) -> dict[str, Any]:
+        request = Request(url, method="GET")
+        with urlopen(request, timeout=15) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _parse_llm_json(self, content: str) -> dict[str, Any]:
+        """Parse JSON object from LLM content with minor normalization."""
+        raw = content.strip()
+        if not raw:
+            raise ValueError("Groq returned empty text content")
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+            raw = raw.strip()
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if match:
+            candidate = match.group(0)
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+
+        preview = raw[:300].replace("\n", " ")
+        raise ValueError(f"Invalid JSON response from Groq: {preview}")
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
+
+
+async def main() -> None:
+    configure_logging()
+    agent = GeoOracleAgent()
+    await agent.run()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        LOGGER.info("GeoOracle interrupted by user")

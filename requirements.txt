@@ -5,3 +5,5 @@ numpy
 yfinance
 streamlit
 pandas
+groq
+plotly

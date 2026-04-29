@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import os
 from typing import Any, Literal
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
 from agents.base_agent import BaseAgent
@@ -29,7 +33,8 @@ class InstrumentSnapshot:
 
     @property
     def current(self) -> float:
-        return float(self.closes[-1])
+        latest = np.asarray(self.closes).reshape(-1)[-1]
+        return float(latest)
 
     @property
     def mean_20d(self) -> float:
@@ -208,15 +213,8 @@ class ValueHunterAgent(BaseAgent):
 
         snapshots: dict[str, InstrumentSnapshot] = {}
         for symbol in self.MARKET_SYMBOLS:
-            frame = await asyncio.to_thread(
-                yf.download,
-                symbol,
-                period="40d",
-                interval=self.TIMEFRAME,
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-            )
+            frame, source = await self._download_symbol_frame(symbol)
+            frame = self._normalize_ohlcv_frame(frame)
             if frame.empty:
                 self.logger.warning(
                     "No data for %s (holiday/market closed/provider issue)",
@@ -226,6 +224,7 @@ class ValueHunterAgent(BaseAgent):
 
             last_window = frame.tail(self.LOOKBACK_WINDOW_DAYS).copy()
             closes = last_window["Close"].dropna().to_numpy(dtype=float)
+            closes = np.asarray(closes).reshape(-1)
             if closes.size < self.LOOKBACK_WINDOW_DAYS:
                 self.logger.warning(
                     "Insufficient bars for %s (got=%s need=%s)",
@@ -239,7 +238,7 @@ class ValueHunterAgent(BaseAgent):
                 symbol=symbol,
                 closes=closes,
             )
-            await self._persist_candles(symbol, last_window)
+            await self._persist_candles(symbol, last_window, source)
 
         required = {self.COPPER_SYMBOL, self.GOLD_SYMBOL, self.ENERGY_SYMBOL}
         if not required.issubset(snapshots.keys()):
@@ -251,7 +250,109 @@ class ValueHunterAgent(BaseAgent):
             return None
         return snapshots
 
-    async def _persist_candles(self, symbol: str, frame: Any) -> None:
+    async def _download_symbol_frame(
+        self,
+        symbol: str,
+    ) -> tuple[pd.DataFrame, str]:
+        """Download market data with selective provider routing."""
+        if symbol == self.COPPER_SYMBOL and self._alpha_vantage_api_key:
+            frame = await self._download_copper_alpha_vantage()
+            if not frame.empty:
+                return frame, "alphavantage"
+            self.logger.warning(
+                (
+                    "AlphaVantage copper feed returned empty data, "
+                    "fallback to yfinance"
+                ),
+            )
+
+        frame = await asyncio.to_thread(
+            yf.download,
+            symbol,
+            period="40d",
+            interval=self.TIMEFRAME,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        return frame, "yfinance"
+
+    async def _download_copper_alpha_vantage(self) -> pd.DataFrame:
+        """Fetch copper series from AlphaVantage daily time-series API."""
+        params = urlencode(
+            {
+                "function": "TIME_SERIES_DAILY",
+                "symbol": self.COPPER_SYMBOL,
+                "outputsize": "compact",
+                "apikey": self._alpha_vantage_api_key,
+            }
+        )
+        url = f"https://www.alphavantage.co/query?{params}"
+        payload = await asyncio.to_thread(self._http_get_json, url)
+        series = payload.get("Time Series (Daily)", {})
+        if not isinstance(series, dict) or not series:
+            return pd.DataFrame()
+
+        rows: list[dict[str, Any]] = []
+        for dt_str, row in series.items():
+            if not isinstance(row, dict):
+                continue
+            try:
+                rows.append(
+                    {
+                        "Date": pd.to_datetime(dt_str, utc=True),
+                        "Open": float(row["1. open"]),
+                        "High": float(row["2. high"]),
+                        "Low": float(row["3. low"]),
+                        "Close": float(row["4. close"]),
+                        "Volume": float(row.get("5. volume", 0.0)),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        if not rows:
+            return pd.DataFrame()
+        frame = pd.DataFrame(rows).set_index("Date").sort_index()
+        return frame
+
+    def _normalize_ohlcv_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Normalize provider output to flat OHLCV columns."""
+        if frame.empty:
+            return frame
+
+        normalized = frame.copy()
+        if isinstance(normalized.columns, pd.MultiIndex):
+            if normalized.columns.nlevels >= 2:
+                last_level = normalized.columns.get_level_values(-1)
+                if {"Open", "High", "Low", "Close"}.issubset(set(last_level)):
+                    normalized.columns = last_level
+                else:
+                    normalized.columns = normalized.columns.get_level_values(0)
+            else:
+                normalized.columns = normalized.columns.get_level_values(0)
+
+        normalized.columns = [str(column) for column in normalized.columns]
+        required = ["Open", "High", "Low", "Close"]
+        if not all(column in normalized.columns for column in required):
+            return pd.DataFrame()
+        if "Volume" not in normalized.columns:
+            normalized["Volume"] = np.nan
+        normalized = normalized[["Open", "High", "Low", "Close", "Volume"]]
+        for column in ["Open", "High", "Low", "Close", "Volume"]:
+            normalized[column] = pd.to_numeric(
+                normalized[column],
+                errors="coerce",
+            )
+        normalized = normalized.dropna(subset=["Open", "High", "Low", "Close"])
+        return normalized
+
+    async def _persist_candles(
+        self,
+        symbol: str,
+        frame: Any,
+        source: str,
+    ) -> None:
         """Store fetched OHLCV in TimescaleDB candles hypertable."""
         candles: list[CandleRecord] = []
         for ts, row in frame.iterrows():
@@ -270,7 +371,7 @@ class ValueHunterAgent(BaseAgent):
                         low=float(row["Low"]),
                         close=float(row["Close"]),
                         volume=volume,
-                        source="yfinance",
+                        source=source,
                     )
                 )
             except (TypeError, ValueError, KeyError):
@@ -329,3 +430,28 @@ class ValueHunterAgent(BaseAgent):
             "Sin divergencia extrema confirmada por contexto geopolítico",
             0.35,
         )
+
+    def _http_get_json(self, url: str) -> dict[str, Any]:
+        request = Request(url, method="GET")
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
+
+
+async def main() -> None:
+    configure_logging()
+    agent = ValueHunterAgent()
+    await agent.run()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        LOGGER.info("ValueHunter interrupted by user")
