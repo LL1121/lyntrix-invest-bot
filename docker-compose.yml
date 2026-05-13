@@ -53,6 +53,8 @@ services:
     ports:
       - "${REDIS_BIND:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -136,6 +138,7 @@ services:
 
   dashboard:
     <<: *lyntrix-worker
+    container_name: lyntrix_invest_dashboard
     command:
       [
         "streamlit",
@@ -151,6 +154,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - default
+      - lyntrix_network
 
 volumes:
   timescaledb_data:
+  redis_data:
+networks:
+  lyntrix_network:
+    external: true
