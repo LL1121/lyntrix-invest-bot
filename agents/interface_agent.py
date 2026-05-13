@@ -32,7 +32,7 @@ class InterfaceAgent:
     def __init__(self) -> None:
         self._db = Database()
         self._groq_api_key = os.getenv("GROQ_API_KEY")
-        self._groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self._groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         self._client: AsyncGroq | None = None
         if self._groq_api_key:
             self._client = AsyncGroq(api_key=self._groq_api_key)

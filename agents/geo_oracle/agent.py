@@ -141,6 +141,15 @@ class GeoOracleAgent(BaseAgent):
         if self._news_api_key:
             try:
                 return await self._fetch_newsapi_articles()
+            except HTTPError as exc:
+                if exc.code == 429:
+                    self.logger.warning(
+                        "NewsAPI rate limited (429); using local fallback headlines",
+                    )
+                else:
+                    self.logger.exception(
+                        "NewsAPI HTTP error, using local fallback",
+                    )
             except Exception:
                 self.logger.exception(
                     "NewsAPI request failed, using local fallback",
@@ -302,7 +311,7 @@ class GeoOracleAgent(BaseAgent):
         for attempt in range(1, max_attempts + 1):
             try:
                 completion = await self.client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model=self._groq_model,
                     temperature=0.2,
                     max_tokens=1024,
                     stream=False,
@@ -338,7 +347,12 @@ class GeoOracleAgent(BaseAgent):
                 )
             except groq.RateLimitError:
                 if attempt >= max_attempts:
-                    raise
+                    self.logger.warning(
+                        "Groq rate limit persisted after %s attempts; "
+                        "using heuristic GeoOracle analysis",
+                        max_attempts,
+                    )
+                    return await self._heuristic_analysis(articles)
                 sleep_s = 2 ** attempt
                 self.logger.warning(
                     "Groq rate limit hit (attempt %s/%s), retrying in %ss",

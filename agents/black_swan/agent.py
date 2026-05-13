@@ -389,3 +389,23 @@ class BlackSwanAgent(BaseAgent):
 
         latest = self._rolling_return(closes, days=days)
         return (latest - mean) / std
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
+
+
+async def main() -> None:
+    configure_logging()
+    agent = BlackSwanAgent()
+    await agent.run()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        LOGGER.info("BlackSwan interrupted by user")
