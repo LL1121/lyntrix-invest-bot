@@ -51,7 +51,7 @@ class GeoOracleAgent(BaseAgent):
         super().__init__(name="geo_oracle")
         self._llm_provider = os.getenv("LLM_PROVIDER", "groq").lower()
         self._groq_api_key = os.getenv("GROQ_API_KEY")
-        self._groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        self._groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         self._openai_api_key = os.getenv("OPENAI_API_KEY")
         self._anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         self._news_api_key = os.getenv("NEWS_API_KEY")
